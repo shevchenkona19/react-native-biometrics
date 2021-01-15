@@ -8,7 +8,7 @@ import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.bridge.WritableNativeMap;
 
 public class SimplePromptCallback extends BiometricPrompt.AuthenticationCallback {
-    private Promise promise;
+    private final Promise promise;
 
     public SimplePromptCallback(Promise promise) {
         super();
@@ -24,7 +24,7 @@ public class SimplePromptCallback extends BiometricPrompt.AuthenticationCallback
             resultMap.putString("error", "User cancellation");
             this.promise.resolve(resultMap);
         } else {
-            this.promise.reject(errString.toString(), errString.toString());
+            this.promise.reject(Utils.getErrorCode(errorCode), errString.toString());
         }
     }
 

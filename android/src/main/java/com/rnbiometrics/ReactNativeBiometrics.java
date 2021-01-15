@@ -5,6 +5,8 @@ import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.util.Base64;
 
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.biometric.BiometricManager;
 import androidx.biometric.BiometricPrompt;
 import androidx.biometric.BiometricPrompt.AuthenticationCallback;
@@ -20,12 +22,20 @@ import com.facebook.react.bridge.UiThreadUtil;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.bridge.WritableNativeMap;
 
+import java.io.IOException;
+import java.security.InvalidAlgorithmParameterException;
+import java.security.InvalidKeyException;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.NoSuchProviderException;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.Signature;
+import java.security.UnrecoverableKeyException;
+import java.security.cert.CertificateException;
 import java.security.spec.RSAKeyGenParameterSpec;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
@@ -36,10 +46,23 @@ import java.util.concurrent.Executors;
 
 public class ReactNativeBiometrics extends ReactContextBaseJavaModule {
 
+    private interface BiometryType {
+        String BIOMETRICS = "biometrics";
+    }
+
     protected String biometricKeyAlias = "biometric_key";
+
+    private KeyStore store;
 
     public ReactNativeBiometrics(ReactApplicationContext reactContext) {
         super(reactContext);
+        try {
+            store = KeyStore.getInstance("AndroidKeyStore");
+            store.load(null);
+        } catch (Exception e) {
+            store = null;
+            ExceptionLogger.log(e);
+        }
     }
 
     @Override
@@ -49,16 +72,14 @@ public class ReactNativeBiometrics extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void isSensorAvailable(Promise promise) {
-        try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 ReactApplicationContext reactApplicationContext = getReactApplicationContext();
                 BiometricManager biometricManager = BiometricManager.from(reactApplicationContext);
                 int canAuthenticate = biometricManager.canAuthenticate();
-
                 if (canAuthenticate == BiometricManager.BIOMETRIC_SUCCESS) {
                     WritableMap resultMap = new WritableNativeMap();
                     resultMap.putBoolean("available", true);
-                    resultMap.putString("biometryType", "Biometrics");
+                    resultMap.putString("biometryType", BiometryType.BIOMETRICS);
                     promise.resolve(resultMap);
                 } else {
                     WritableMap resultMap = new WritableNativeMap();
@@ -66,27 +87,23 @@ public class ReactNativeBiometrics extends ReactContextBaseJavaModule {
 
                     switch (canAuthenticate) {
                         case BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE:
-                            resultMap.putString("error", "BIOMETRIC_ERROR_NO_HARDWARE");
+                            resultMap.putString("error", BiometryErrors.ERROR_BIOMETRIC_NO_HARDWARE);
                             break;
                         case BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE:
-                            resultMap.putString("error", "BIOMETRIC_ERROR_HW_UNAVAILABLE");
+                            resultMap.putString("error", BiometryErrors.ERROR_BIOMETRIC_HW_UNAVAILABLE);
                             break;
                         case BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED:
-                            resultMap.putString("error", "BIOMETRIC_ERROR_NONE_ENROLLED");
+                            resultMap.putString("error", BiometryErrors.ERROR_BIOMETRIC_NONE_ENROLLED);
                             break;
                     }
-
                     promise.resolve(resultMap);
                 }
             } else {
                 WritableMap resultMap = new WritableNativeMap();
                 resultMap.putBoolean("available", false);
-                resultMap.putString("error", "Unsupported android version");
+                resultMap.putString("error", BiometryErrors.ANDROID_VERSION_UNSUPPORTED);
                 promise.resolve(resultMap);
             }
-        } catch (Exception e) {
-            promise.reject("Error detecting biometrics availability: " + e.getMessage(), "Error detecting biometrics availability: " + e.getMessage());
-        }
     }
 
     @ReactMethod
@@ -94,7 +111,8 @@ public class ReactNativeBiometrics extends ReactContextBaseJavaModule {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 deleteBiometricKey();
-                KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore");
+                KeyPairGenerator keyPairGenerator;
+                keyPairGenerator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore");
                 KeyGenParameterSpec keyGenParameterSpec = new KeyGenParameterSpec.Builder(biometricKeyAlias, KeyProperties.PURPOSE_SIGN)
                         .setDigests(KeyProperties.DIGEST_SHA256)
                         .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
@@ -113,24 +131,33 @@ public class ReactNativeBiometrics extends ReactContextBaseJavaModule {
                 resultMap.putString("publicKey", publicKeyString);
                 promise.resolve(resultMap);
             } else {
-                promise.reject("Cannot generate keys on android versions below 6.0", "Cannot generate keys on android versions below 6.0");
+                promise.reject(BiometryErrors.ANDROID_VERSION_UNSUPPORTED, "Cannot generate keys on android versions below 6.0");
             }
-        } catch (Exception e) {
-            promise.reject("Error generating public private keys: " + e.getMessage(), "Error generating public private keys");
+        } catch (NoSuchAlgorithmException e) {
+            ExceptionLogger.log(e);
+            promise.reject(BiometryErrors.CREATE_KEYS_EXCEPTION, ExceptionLogger.getExceptionMessage("RSA Algorithm is not found :("));
+        } catch (NoSuchProviderException e) {
+            ExceptionLogger.log(e);
+            promise.reject(BiometryErrors.CREATE_KEYS_EXCEPTION, ExceptionLogger.getExceptionMessage("RSA Algorithm is not found :("));
+        } catch (InvalidAlgorithmParameterException e) {
+            ExceptionLogger.log(e);
+            promise.reject(BiometryErrors.CREATE_KEYS_EXCEPTION, ExceptionLogger.getExceptionMessage("Check params for RSA algorithm"));
         }
+
     }
 
     @ReactMethod
     public void deleteKeys(Promise promise) {
-        if (doesBiometricKeyExist()) {
-            boolean deletionSuccessful = deleteBiometricKey();
+        FunctionResult exists = doesBiometricKeyExist();
+        if (exists.success && exists.result) {
+            FunctionResult deleted = deleteBiometricKey();
 
-            if (deletionSuccessful) {
+            if (deleted.success && deleted.result) {
                 WritableMap resultMap = new WritableNativeMap();
                 resultMap.putBoolean("keysDeleted", true);
                 promise.resolve(resultMap);
             } else {
-                promise.reject("Error deleting biometric key from keystore", "Error deleting biometric key from keystore");
+                promise.reject(BiometryErrors.ERROR_DELETING_KEYS, ExceptionLogger.getExceptionMessage(deleted.reason));
             }
         } else {
             WritableMap resultMap = new WritableNativeMap();
@@ -146,38 +173,54 @@ public class ReactNativeBiometrics extends ReactContextBaseJavaModule {
                     new Runnable() {
                         @Override
                         public void run() {
+                            if (store == null) {
+                                promise.reject(BiometryErrors.ERROR_INIT_KEY_STORE, ExceptionLogger.getExceptionMessage("Keystore did not initialized"));
+                                return;
+                            }
                             try {
                                 String cancelButtomText = params.getString("cancelButtonText");
                                 String promptMessage = params.getString("promptMessage");
                                 String payload = params.getString("payload");
 
                                 Signature signature = Signature.getInstance("SHA256withRSA");
-                                KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
-                                keyStore.load(null);
 
-                                PrivateKey privateKey = (PrivateKey) keyStore.getKey(biometricKeyAlias, null);
+                                PrivateKey privateKey = (PrivateKey) store.getKey(biometricKeyAlias, null);
                                 signature.initSign(privateKey);
 
                                 BiometricPrompt.CryptoObject cryptoObject = new BiometricPrompt.CryptoObject(signature);
 
                                 AuthenticationCallback authCallback = new CreateSignatureCallback(promise, payload);
                                 FragmentActivity fragmentActivity = (FragmentActivity) getCurrentActivity();
-                                Executor executor = Executors.newSingleThreadExecutor();
-                                BiometricPrompt biometricPrompt = new BiometricPrompt(fragmentActivity, executor, authCallback);
+                                if (fragmentActivity != null) {
+                                    Executor executor = Executors.newSingleThreadExecutor();
+                                    BiometricPrompt biometricPrompt = new BiometricPrompt(fragmentActivity, executor, authCallback);
 
-                                PromptInfo promptInfo = new PromptInfo.Builder()
-                                        .setDeviceCredentialAllowed(false)
-                                        .setNegativeButtonText(cancelButtomText)
-                                        .setTitle(promptMessage)
-                                        .build();
-                                biometricPrompt.authenticate(promptInfo, cryptoObject);
-                            } catch (Exception e) {
-                                promise.reject("Error signing payload: " + e.getMessage(), "Error generating signature: " + e.getMessage());
+                                    PromptInfo promptInfo = new PromptInfo.Builder()
+                                            .setDeviceCredentialAllowed(false)
+                                            .setNegativeButtonText(cancelButtomText)
+                                            .setTitle(promptMessage)
+                                            .build();
+                                    biometricPrompt.authenticate(promptInfo, cryptoObject);
+                                } else {
+                                    promise.reject(BiometryErrors.ERROR_NO_ACTIVITY, "Error creating signature: activity is not in foreground");
+                                }
+                            } catch (UnrecoverableKeyException e) {
+                                ExceptionLogger.log(e);
+                                promise.reject(BiometryErrors.ERROR_UNRECOVERABLE_KEY, ExceptionLogger.getExceptionMessage("Key in the keystore cannot be recovered"));
+                            } catch (NoSuchAlgorithmException e) {
+                                ExceptionLogger.log(e);
+                                promise.reject(BiometryErrors.CREATE_SIGNATURE_EXCEPTION, ExceptionLogger.getExceptionMessage("SHA256withRSA is not available"));
+                            } catch (KeyStoreException e) {
+                                ExceptionLogger.log(e);
+                                promise.reject(BiometryErrors.CREATE_KEYS_EXCEPTION, ExceptionLogger.getExceptionMessage("Cannot read key from key store"));
+                            } catch (InvalidKeyException e) {
+                                ExceptionLogger.log(e);
+                                promise.reject(BiometryErrors.CREATE_KEYS_EXCEPTION, ExceptionLogger.getExceptionMessage("Invalid key in keystore, try to regenerate it"));
                             }
                         }
                     });
         } else {
-            promise.reject("Cannot generate keys on android versions below 6.0", "Cannot generate keys on android versions below 6.0");
+            promise.reject(BiometryErrors.ANDROID_VERSION_UNSUPPORTED, "Cannot generate keys on android versions below 6.0");
         }
     }
 
@@ -188,63 +231,92 @@ public class ReactNativeBiometrics extends ReactContextBaseJavaModule {
                     new Runnable() {
                         @Override
                         public void run() {
-                            try {
                                 String cancelButtomText = params.getString("cancelButtonText");
                                 String promptMessage = params.getString("promptMessage");
 
                                 AuthenticationCallback authCallback = new SimplePromptCallback(promise);
                                 FragmentActivity fragmentActivity = (FragmentActivity) getCurrentActivity();
-                                Executor executor = Executors.newSingleThreadExecutor();
-                                BiometricPrompt biometricPrompt = new BiometricPrompt(fragmentActivity, executor, authCallback);
+                                if (fragmentActivity != null) {
+                                    Executor executor = Executors.newSingleThreadExecutor();
+                                    BiometricPrompt biometricPrompt = new BiometricPrompt(fragmentActivity, executor, authCallback);
 
-                                PromptInfo promptInfo = new PromptInfo.Builder()
-                                        .setDeviceCredentialAllowed(false)
-                                        .setNegativeButtonText(cancelButtomText)
-                                        .setTitle(promptMessage)
-                                        .build();
-                                biometricPrompt.authenticate(promptInfo);
-                            } catch (Exception e) {
-                                promise.reject("Error displaying local biometric prompt: " + e.getMessage(), "Error displaying local biometric prompt: " + e.getMessage());
-                            }
+                                    PromptInfo promptInfo = new PromptInfo.Builder()
+                                            .setDeviceCredentialAllowed(false)
+                                            .setNegativeButtonText(cancelButtomText)
+                                            .setTitle(promptMessage)
+                                            .build();
+                                    biometricPrompt.authenticate(promptInfo);
+                                } else {
+                                    promise.reject(BiometryErrors.ERROR_NO_ACTIVITY, "Error creating signature: activity is not in foreground");
+                                }
                         }
                     });
         } else {
-            promise.reject("Cannot display biometric prompt on android versions below 6.0", "Cannot display biometric prompt on android versions below 6.0");
+            promise.reject(BiometryErrors.ANDROID_VERSION_UNSUPPORTED, "Cannot display biometric prompt on android versions below 6.0");
         }
     }
 
     @ReactMethod
     public void biometricKeysExist(Promise promise) {
+            FunctionResult doesBiometricKeyExist = doesBiometricKeyExist();
+            if (doesBiometricKeyExist.success) {
+                WritableMap resultMap = new WritableNativeMap();
+                resultMap.putBoolean("keysExist", doesBiometricKeyExist.result);
+                promise.resolve(resultMap);
+            } else {
+                promise.reject(BiometryErrors.ERROR_CHECK_KEYS_EXIST, ExceptionLogger.getExceptionMessage(doesBiometricKeyExist.reason));
+            }
+    }
+
+    protected FunctionResult doesBiometricKeyExist() {
+        if (store == null) {
+            return new FunctionResult(false, "Key store did not initialized");
+        }
         try {
-            boolean doesBiometricKeyExist = doesBiometricKeyExist();
-            WritableMap resultMap = new WritableNativeMap();
-            resultMap.putBoolean("keysExist", doesBiometricKeyExist);
-            promise.resolve(resultMap);
-        } catch (Exception e) {
-            promise.reject("Error checking if biometric key exists: " + e.getMessage(), "Error checking if biometric key exists: " + e.getMessage());
+            return new FunctionResult(true, store.containsAlias(biometricKeyAlias));
+        } catch (KeyStoreException e) {
+            ExceptionLogger.log(e);
+            return new FunctionResult(false, "KeyStore exception: " + e.getMessage());
         }
     }
-
-    protected boolean doesBiometricKeyExist() {
-      try {
-        KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
-        keyStore.load(null);
-
-        return keyStore.containsAlias(biometricKeyAlias);
-      } catch (Exception e) {
-        return false;
-      }
-    }
-
-    protected boolean deleteBiometricKey() {
+    protected FunctionResult deleteBiometricKey() {
         try {
             KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
             keyStore.load(null);
 
             keyStore.deleteEntry(biometricKeyAlias);
-            return true;
-        } catch (Exception e) {
-            return false;
+            return new FunctionResult(true, true);
+        } catch (IOException e) {
+            ExceptionLogger.log(e);
+            return new FunctionResult(false, "IOException for keys deletion: " + e.getMessage());
+        } catch (CertificateException e) {
+            ExceptionLogger.log(e);
+            return new FunctionResult(false, "Certificate exception: " + e.getMessage());
+        } catch (NoSuchAlgorithmException e) {
+            ExceptionLogger.log(e);
+            return new FunctionResult(false, "No such algorithm exception: " + e.getMessage());
+        } catch (KeyStoreException e) {
+            ExceptionLogger.log(e);
+            return new FunctionResult(false, "Key store exception: " + e.getMessage());
         }
     }
+
+    private static class FunctionResult {
+        final boolean success;
+        final boolean result;
+        @Nullable
+        String reason;
+
+        protected FunctionResult(boolean isSuccess, @NonNull String reason) {
+            success = isSuccess;
+            this.reason = reason;
+            result = false;
+        }
+
+        protected FunctionResult(boolean isSuccess, boolean result) {
+            success = isSuccess;
+            this.result = result;
+        }
+    }
+
 }
